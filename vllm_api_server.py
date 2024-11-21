@@ -20,6 +20,26 @@ import os
 import io
 import soundfile as sf
 import base64
+import logging
+from pydantic import BaseModel
+from typing import Optional
+
+logging.basicConfig(level=logging.INFO)
+
+class BaseResponse(BaseModel):
+    type: str
+    content: str
+    state: Optional[str] = None
+
+class StreamAudioResponse(BaseResponse):
+    state: str = "stream"
+
+class CompleteAudioResponse(BaseResponse):
+    state: str = "end"
+
+class CompleteTextResponse(BaseResponse):
+    pass
+
 
 app = FastAPI()
 
@@ -69,10 +89,11 @@ class ModelWorker:
         prompt = prompt
         prompt_type = prompt_type
 
-        if prompt_type == "audio":
+        if prompt_type == "audio":           
             audio_bytes = decode_base64_audio(prompt)
             # 如果输入为音频，将其转换为音频 tokens
             audio_tokens = extract_speech_token(whisper_model, feature_extractor, [audio_bytes])[0]
+            
             if len(audio_tokens) == 0:
                 raise ValueError("No audio tokens extracted")
             audio_tokens = "".join([f"<|audio_{x}|>" for x in audio_tokens])
@@ -116,7 +137,8 @@ class ModelWorker:
             "skip_special_tokens": True,
         }
         sampling_params = SamplingParams(**params_dict)
-
+        first_token_time = None
+        start_time = time.time()
         async for output in model.generate(
                 TokensPrompt(**{
                     "prompt_token_ids": input_ids,
@@ -124,6 +146,11 @@ class ModelWorker:
             sampling_params=sampling_params,
             request_id=f"{time.time()}"
             ):
+            if first_token_time is None:
+                first_token_time = time.time()
+                first_token_latency = first_token_time - start_time
+                logger.info(f"Latency for generating first token: {first_token_latency} seconds")
+            
             yield int(output.outputs[0].token_ids[-1])
 
     @torch.inference_mode()
@@ -140,6 +167,9 @@ class ModelWorker:
         prev_mel = None
         is_finalize = False
         block_size = 10
+
+        start_decode_time = time.time()
+        token_count = 0
 
         async for token_id in generate_stream_output:
             if token_id == end_token_id:
@@ -170,7 +200,9 @@ class ModelWorker:
                 sf.write(audio_io, audio_data, 22050, format='wav')
                 audio_io.seek(0)
                 base64_stream_data = base64.b64encode(audio_io.read()).decode('utf-8')
-                yield json.dumps({"type": "audio", "content": base64_stream_data, "state": "stream"}) + "\n"
+                stream_response = StreamAudioResponse(type="audio", content=base64_stream_data)
+                yield json.dumps(stream_response.model_dump()) + "\n"
+                # yield json.dumps({"type": "audio", "content": base64_stream_data, "state": "stream"}) + "\n"
                 audio_io.truncate(0)
                 audio_io.seek(0)
 
@@ -180,11 +212,14 @@ class ModelWorker:
                     audio_tokens.append(token_id - audio_offset)
                 else:
                     text_tokens.append(token_id)
-
+            
+            token_count += 1
         # text
         complete_text = self.glm_tokenizer.decode(complete_tokens, spaces_between_special_tokens=False)
-        yield json.dumps({"type": "text", "content": complete_text}) + "\n"
-        
+        text_response = CompleteTextResponse(type="text", content=complete_text)
+        # yield json.dumps({"type": "text", "content": complete_text}) + "\n"
+        yield json.dumps(text_response.model_dump()) + "\n"
+
         # chunk audio merge
         tts_speech = torch.cat(tts_speechs, dim=-1).cpu().numpy()
         audio_io = io.BytesIO()
@@ -195,8 +230,15 @@ class ModelWorker:
             base64_data = base64.b64encode(data).decode('utf-8')
             if not data:
                 break
-            yield json.dumps({"type": "audio", "content": base64_data, "state": "end"}) + "\n"
-        
+            complete_audio_response = CompleteAudioResponse(
+                type="audio", 
+                content=base64_data, 
+            )
+            yield json.dumps(complete_audio_response.model_dump()) +"\n"
+            # yield json.dumps({"type": "audio", "content": base64_data, "state": "end"}) + "\n"
+        audio_decode_latency = time.time() - start_decode_time
+        tokens_per_second = token_count / audio_decode_latency if audio_decode_latency > 0 else 0
+        logger.info(f"Decode efficiency: {tokens_per_second} tokens/second")   
         audio_io.close()
 
 
@@ -208,7 +250,7 @@ class ModelWorker:
         max_new_tokens = params["max_new_tokens"]
         
         input_tokens = self.message_tokenizer(prompt, prompt_type, self.whisper_model, self.feature_extractor)
-        print("input_tokens:", input_tokens)
+        logger.info(f"input_tokens: {input_tokens}")
 
         model_output = self.generate_stream(input_tokens, temperature, top_p, max_new_tokens)
         
@@ -240,4 +282,4 @@ if __name__ == "__main__":
     
     worker = ModelWorker(args.model_path, args.tokenizer_path, args.flow_path, args.dtype, args.device)
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    uvicorn.run(app, host=args.host, port=args.port)
